@@ -6,7 +6,7 @@ Configuration (environment variables win over the local config file):
   PASSNOTE_CA                   certificate to trust for https (default: ca.pem in PASSNOTE_HOME if it exists, else the
                                 system's trusted certificates)
   PASSNOTE_HOME                 local directory, default ~/.config/claude-passnote; holds config.json ({"url", "token",
-                                "ca"}, written by `init`), ca.pem, the list of enabled sessions and the hooks'
+                                "ca", "name"}, written by `init`), ca.pem, the list of enabled sessions and the hooks'
                                 per-session state. It is outside the plugin, so updating or uninstalling the plugin
                                 keeps it.
 Opt-in: passnote is active only in sessions that turned it on, so other conversations see no tools, get no hook output
@@ -16,15 +16,19 @@ and make no network calls:
                                 PASSNOTE_HOME/sessions; the /passnote:enable command does this
   PASSNOTE_ENABLE=0             forces it off.
 
-usage: python3 client.py {init,enable,disable,status,inbox,send,ack} ...
+usage: python3 client.py {init,hash,enable,disable,status,inbox,send,ack} ...
   init --name NAME --url URL [--ca CERT]
                                 create your token locally (saved in config.json, never printed) and print the line for
                                 the server's tokens.json (only the token's SHA-256, which is not secret); --ca copies the
-                                server's self-signed certificate to PASSNOTE_HOME/ca.pem
+                                server's self-signed certificate to PASSNOTE_HOME/ca.pem. Run again with a new URL or
+                                certificate to switch servers: the token stays the same
+  hash [--name NAME]            print that line again (default name: the one given to init)
+  status                        this session, the configuration, and who you are and whom you can write to
 """
 import argparse
 import json
 import os
+import re
 import shutil
 import ssl
 import sys
@@ -32,10 +36,14 @@ import urllib.error
 import urllib.request
 
 TYPES = ("info", "request", "interface_change", "claim", "done")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,39}\Z")     # what server.py users add accepts
+NAME_RULE = "1 to 40 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit"
 
 
 class PassnoteError(Exception):
-    pass
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code        # HTTP status, when the server answered with an error
 
 
 def home():
@@ -43,7 +51,8 @@ def home():
 
 
 def config():
-    """-> {"url", "token", "ca"} (url and token may be empty when not configured, ca when the system store is used)."""
+    """-> {"url", "token", "ca", "name"} (url and token may be empty when not configured, ca when the system store is
+    used, name when init has not recorded it)."""
     c = {}
     try:
         with open(os.path.join(home(), "config.json"), encoding="utf-8") as f:
@@ -55,7 +64,7 @@ def config():
     ca = os.environ.get("PASSNOTE_CA") or c.get("ca") or ""
     if not ca and os.path.exists(os.path.join(home(), "ca.pem")):
         ca = os.path.join(home(), "ca.pem")
-    return {"url": url, "token": token, "ca": ca}
+    return {"url": url, "token": token, "ca": ca, "name": c.get("name") or ""}
 
 
 def session_id(given=None):
@@ -110,7 +119,7 @@ def call(method, path, payload=None, timeout=5.0):
             msg = json.loads(e.read().decode("utf-8")).get("error", "")
         except (ValueError, OSError):
             msg = ""
-        raise PassnoteError(f"server said {e.code}: {msg}") from None
+        raise PassnoteError(f"server said {e.code}: {msg}", e.code) from None
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise PassnoteError(f"server unreachable: {e}") from None
 
@@ -130,6 +139,41 @@ def ack(ids, timeout=5.0):
     return call("POST", "/ack", {"ids": [int(i) for i in ids]}, timeout)["acked"]
 
 
+def whoami(timeout=5.0):
+    """-> {"user": your name on the server, "peers": the others' names, or None when the server is older than 0.2.0
+    and cannot list them (it answers /whoami with 404; its /inbox still names the caller)}."""
+    try:
+        w = call("GET", "/whoami", timeout=timeout)
+    except PassnoteError as e:
+        if e.code != 404:
+            raise
+        inbox = call("GET", "/inbox?limit=1", timeout=timeout)
+        w = {"user": inbox.get("user") if isinstance(inbox, dict) else None, "peers": None}
+    if not isinstance(w, dict) or not isinstance(w.get("user"), str) or \
+            not (w.get("peers") is None or isinstance(w["peers"], list)):
+        raise PassnoteError(f"unexpected answer from the server: {w}")
+    return {"user": w["user"], "peers": None if w["peers"] is None else [str(p) for p in w["peers"]]}
+
+
+def describe(who):
+    """whoami() -> one line for people."""
+    if who["peers"] is None:
+        return (f"you are {who['user']}; the others are unknown (this server is older than passnote 0.2.0 and does not "
+                "list them)")
+    if not who["peers"]:
+        return f"you are {who['user']}; nobody else is registered on this server yet"
+    return f"you are {who['user']}; you can send to {', '.join(who['peers'])}"
+
+
+def token_line(name):
+    """The line for the server's tokens.json, '"name": "<SHA-256 of your token>"' (the hash is not secret)."""
+    import hashlib
+    token = config()["token"]
+    if not token:
+        raise PassnoteError("no token yet: run /passnote:init first")
+    return f'"{name}": "{hashlib.sha256(token.encode()).hexdigest()}"'
+
+
 def _set_session(sid, on):
     os.makedirs(home(), exist_ok=True)
     s = enabled_sessions()
@@ -141,11 +185,14 @@ def _set_session(sid, on):
 
 
 def init(name, url, ca=""):
-    """Create your token locally: saved in PASSNOTE_HOME/config.json (never printed); returns the tokens.json line with
-    its SHA-256, which is all the server needs (the hash is not secret). ca: the server's certificate, copied to
+    """Create your token locally: saved in PASSNOTE_HOME/config.json (never printed), with your name; returns the
+    tokens.json line with its SHA-256, which is all the server needs (the hash is not secret). An existing token is kept,
+    so running it again with another URL or certificate switches servers. ca: the server's certificate, copied to
     PASSNOTE_HOME/ca.pem."""
     import hashlib
     import secrets
+    if not NAME.match(name):
+        raise PassnoteError(f"bad name {name!r}: {NAME_RULE}")
     os.makedirs(home(), exist_ok=True)
     path = os.path.join(home(), "config.json")
     try:
@@ -160,6 +207,7 @@ def init(name, url, ca=""):
         c.pop("ca", None)                       # ca.pem in PASSNOTE_HOME is the default
     if not c.get("token"):
         c["token"] = secrets.token_urlsafe(32)
+    c["name"] = name
     fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(c, f)
@@ -174,6 +222,8 @@ def main():
     q.add_argument("--name", required=True, help="your mailbox name, as the others will address you")
     q.add_argument("--url", default="", help="server address, e.g. https://203.0.113.5:8765")
     q.add_argument("--ca", default="", help="the server's self-signed certificate (not needed for a CA-signed one)")
+    q = sub.add_parser("hash", help="print your line for the server's tokens.json again (the token stays the same)")
+    q.add_argument("--name", default="", help="your name on the server (default: the one given to init)")
     for name in ("enable", "disable", "status"):
         q = sub.add_parser(name)
         q.add_argument("--session", default="", help="session id (default: $CLAUDE_CODE_SESSION_ID)")
@@ -194,7 +244,15 @@ def main():
         if a.cmd == "init":
             path, line = init(a.name, a.url, a.ca)
             print(f"token saved in {path} (keep it there; PASSNOTE_TOKEN, if set, overrides it)\n"
-                  f"line for the server's tokens.json (not secret, send it to whoever runs the server):\n{line}")
+                  "line for the server's tokens.json (not secret; send it to whoever runs the server, who adds it with "
+                  f"`python3 server.py users add NAME HASH`):\n{line}")
+        elif a.cmd == "hash":
+            name = a.name or config()["name"]
+            if not name:
+                sys.exit("give your name on the server: hash --name NAME")
+            if not NAME.match(name):
+                sys.exit(f"bad name {name!r}: {NAME_RULE}")
+            print(token_line(name))
         elif a.cmd in ("enable", "disable"):
             sid = session_id(a.session)
             if not sid:
@@ -209,6 +267,18 @@ def main():
                   f"url {c['url'] or '-'}, certificate {c['ca'] or 'system store'}, home {home()}")
             if configured():
                 print("server:", call("GET", "/health"))
+                try:
+                    who = whoami()
+                    print(describe(who))
+                except PassnoteError as e:
+                    if e.code != 401:
+                        raise
+                    who = None
+                    print(f"{e}: the server does not know your token yet; send the line below to whoever runs it")
+                name = who["user"] if who else c["name"]
+                print("your line for the server's tokens.json:", token_line(name or "<your name>"))
+                if who is None:
+                    sys.exit(1)
         elif a.cmd == "inbox":
             out.write((json.dumps(inbox(a.all), ensure_ascii=False, indent=1) + "\n").encode("utf-8"))
         elif a.cmd == "send":

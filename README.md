@@ -17,6 +17,7 @@ Claude Code (Alice's laptop) ─┐                              ┌─ Claude C
 - **Opt-in per session**: passnote is off unless you turn it on for a session.
   - Every other conversation sees no tools, gets no hook output and makes no network calls.
   - The hooks exit in a few lines of bash, without starting Python.
+- **Who is there**: `/passnote:status` shows the server, your name and whom you can send to. The `send` tool lists the same names.
 
 ## Requirements
 
@@ -38,13 +39,17 @@ Claude Code (Alice's laptop) ─┐                              ┌─ Claude C
    /passnote:init alice https://203.0.113.5:8765 /path/to/server-cert.pem
    ```
    - The token is generated on your computer and stored in `~/.config/claude-passnote/config.json`. It is never printed and never leaves the machine.
-   - The command prints a line like `"alice": "<64 hex digits>"`. That is the token's SHA-256, which is not secret. Send it to whoever runs the server.
+   - The command prints a line like `"alice": "<64 hex digits>"`. That is the token's SHA-256, which is not secret. Send it to whoever runs the server, who registers you with it (see [Managing users](#managing-users)).
    - Leave out the certificate if the server uses one from a public CA, such as Let's Encrypt.
+   - Names are 1 to 40 ASCII letters, digits, `.`, `_` or `-`.
 4. **Turn it on** in the session that should use it:
    - `/passnote:enable` turns it on for the current session. The hooks work at once; the MCP tools appear within a few seconds, without a restart.
    - Or start a dedicated session with `PASSNOTE_ENABLE=1`, for example `PASSNOTE_ENABLE=1 claude`, or a desktop session preset that sets it.
    - Do not set `PASSNOTE_ENABLE=1` globally, or every session will use passnote.
-5. **Check:** `/passnote:status`.
+5. **Check:** `/passnote:status`. It shows the server, whether it answers, your name there and whom you can send to:
+   ```
+   you are alice; you can send to bob, carol
+   ```
 
 Other commands:
 - `/passnote:disable` turns passnote off for the session.
@@ -59,13 +64,14 @@ The server files are in [`server/`](server/). The steps below assume a Linux mac
    ssh you@203.0.113.5 'mkdir -p ~/passnote && chmod 700 ~/passnote'
    scp server/server.py server/run.sh you@203.0.113.5:~/passnote/
    ```
-2. Register the users. Put the hash lines that people sent you (step 3 of the quick start) into `~/passnote/tokens.json`, then run `chmod 600 tokens.json`:
-   ```json
-   {"alice": "<alice's hash>", "bob": "<bob's hash>"}
+2. Register the users. For each hash line people sent you (step 3 of the quick start), run on the server:
+   ```bash
+   cd ~/passnote && python3 server.py users add alice <alice's hash>
    ```
+   - This writes `tokens.json` next to `server.py`, mode 600, which maps names to hashes: `{"alice": "<hash>", "bob": "<hash>"}`. You can also write it by hand.
    - The server stores only hashes. The sender of each message is taken from the token, so nobody can send in someone else's name.
    - Alternatively, `python3 server.py gen-token NAME` prints a new token and its line. You then have to hand the token to that person privately.
-   - Restart the server after changing `tokens.json`.
+   - You can add people later, while the server runs. See [Managing users](#managing-users).
 3. Make a certificate. A self-signed one is fine, and the IP address can be its name:
    ```bash
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
@@ -94,10 +100,50 @@ The server files are in [`server/`](server/). The steps below assume a Linux mac
    It should print `{"ok": true}`.
 7. Back up (optional): `sqlite3 ~/passnote/passnote.db ".backup ~/passnote/backup.db"`.
 
+### Managing users
+
+On the server, in `~/passnote`:
+
+| Command | What it does |
+|---|---|
+| `python3 server.py users list` | who is registered, as `tokens.json` lines |
+| `python3 server.py users add NAME HASH` | registers someone with the line `/passnote:init` printed for them. `--replace` changes the hash of a name that is already there |
+| `python3 server.py users remove NAME` | removes someone. Messages to and from them stay in the database |
+| `python3 server.py stats` | per user: unread, received and sent messages, and the last time they sent or acked one. It only reads the database |
+
+- The running server reads `tokens.json` again as soon as it changes, so none of this needs a restart. That holds for edits by hand too. If the file does not parse, for example an edit saved half way, the server keeps the previous users and says so in its log.
+- `users` rewrites `tokens.json` in one step and keeps its owner and mode, so it also works when run as root for a server that runs as another user.
+- These commands use the `tokens.json` and `passnote.db` next to `server.py`. `--tokens` and `--db` name others.
+
 To change a token:
 1. Delete `token` from that computer's `config.json` and run `/passnote:init` again.
-2. Replace the line in `tokens.json`.
-3. Restart the server.
+2. On the server: `python3 server.py users add NAME <new hash> --replace`.
+
+To update the server, copy the new `server.py` over and restart it once. Clients and servers of different versions work together; with a server older than 0.2.0, `/passnote:status` cannot list the others.
+
+## Switching or moving the server
+
+Your token is made on your computer and does not belong to a server, so switching servers never needs a new token.
+
+**Everyone**, when the server gets a new address or certificate, runs `/passnote:init` again with them:
+```
+/passnote:init alice https://198.51.100.7:8765 /path/to/new-cert.pem
+```
+- The token and the name stay; only the URL and the certificate change. Sessions that are already running use the new server from their next call.
+- `/passnote:status` shows which server you use, and whom you can send to there.
+- If the new server does not know you yet (`server said 401`), send its admin your hash line again. `/passnote:init` and `/passnote:status` print it, and so does `client.py hash`.
+
+**Whoever runs the server**, to move it to another machine:
+1. Set up the new machine: steps 1, 4 and 5 of [Running the server](#running-the-server).
+2. Stop the old server, so that no message arrives after the copy: `kill $(cat ~/passnote/server.pid)`, and remove its cron lines (or `sudo systemctl disable --now passnote`). Otherwise cron starts it again within 5 minutes.
+3. Copy `tokens.json` and the database to the new machine: `passnote.db`, together with `passnote.db-wal` if there is one. SQLite keeps the latest messages in the `-wal` file until it merges them. Everyone stays registered, and unread messages stay unread.
+   ```bash
+   cd ~/passnote && scp tokens.json passnote.db passnote.db-wal you@198.51.100.7:~/passnote/
+   ```
+4. Certificate: a self-signed certificate names the server's IP address, so **a new IP address needs a new certificate** (step 3 of [Running the server](#running-the-server)), and everyone needs the new `cert.pem`. With a domain name that moves to the new machine, or a certificate from a public CA, copy `cert.pem` and `key.pem` along instead; if the URL stays the same, the clients need no change at all.
+5. Start the new server, check it with `curl` (step 6), and tell everyone the new URL and certificate.
+
+To start a new server from scratch instead, skip step 3: everyone sends their hash line again, and the old messages stay behind.
 
 ## Configuration
 
@@ -148,7 +194,7 @@ To use a particular interpreter, set `PASSNOTE_PYTHON` to its full path in the e
 |---|---|
 | `id` | assigned by the server |
 | `from` | the owner of the token that sent it, which cannot be forged |
-| `to` | the recipient's name, as in `tokens.json` |
+| `to` | the recipient's name, as in `tokens.json`. The `send` tool and `/passnote:status` list them |
 | `type` | `info` (for reading, no reply), `request` (asks the recipient to do something), `interface_change` (something others use changed), `claim` (taking a task), `done` (finished something) |
 | `body` | at most 1000 characters. Keep it to a few lines and put details into a file in the project |
 | `refs` | up to 10 strings: commit SHAs, file paths |
@@ -188,8 +234,10 @@ Only for sessions with passnote turned on.
 |---|---|
 | No messages show up | Run `/passnote:status`. Is passnote on for this session? Configured? Does the server answer? |
 | The hooks say nothing | When the server is unreachable or slow, the hooks skip silently so they never hold up the session. This is by design |
-| `server said 401` | The server does not know your token's hash yet. Send the line from `init` to whoever runs the server |
-| Certificate error | The certificate given to `init` is not the server's current one. Run `/passnote:init <name> <url> <new cert>` again |
+| `server said 401` | The server does not know your token's hash yet. Send the line that `/passnote:status` prints to whoever runs the server, who runs `server.py users add` |
+| Certificate error | The certificate given to `init` is not the server's current one, for example after the server moved. Run `/passnote:init <name> <url> <new cert>` again |
+| `/passnote:status` says the others are unknown | The server runs passnote older than 0.2.0. Messages work; to list the others, update its `server.py` and restart it once |
+| `send` does not offer someone who was just added | The `send` tool learns new names after its next call to the server. Until then, `/passnote:mail` can send to them |
 | The `passnote` MCP server fails to start | No Python 3.9+ was found on `PATH`. `/mcp` shows the error. Install Python, or set `PASSNOTE_PYTHON` (see [Which Python is used](#which-python-is-used)) |
 | `/mcp` shows passnote as `connected · no tools` | passnote is not on for this session. Run `/passnote:enable`: the MCP server checks every 2 seconds and tells Claude Code, which loads the tools within a few seconds. If they still do not appear, select `plugin:passnote:passnote` in `/mcp` and choose Reconnect. Until then, `/passnote:mail` works |
 

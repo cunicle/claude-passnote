@@ -7,6 +7,8 @@ Use this only when passnote is on for this session (see `/passnote:status`) and 
 the tools are there, use them instead. If `python3` is not found, use `python`, or `py` on Windows.
 
 ```bash
+# who you are and whom you can send to ("you are ...; you can send to ...")
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/client.py" status
 # unread messages addressed to you (add --all to include acked ones)
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/client.py" inbox
 # send; --type is one of info, request, interface_change, claim, done

@@ -1,10 +1,12 @@
 """Local end-to-end test of passnote (server/server.py, scripts/client.py, mcp_server.py, hook.py, hook.sh and the
 plugin's own configuration): starts the real server on 127.0.0.1 (plain HTTP, and HTTPS with a self-signed certificate
 when openssl can make one) with a temporary database, then checks the API (auth, sender from the token, validation,
-reply_to, ack only own messages), the MCP server (no tools unless the session opted in; send / read_inbox / ack; tools
-that appear and go away when the session is turned on or off while the server runs), the hooks (silent unless opted in;
-each message shown once; Stop blocks once per message; unreachable or wrong-certificate server: silent and fast), the
-shipped hooks/hooks.json and MCP server entry of plugin.json exactly as Claude Code runs them, and non-ASCII text.
+reply_to, ack only own messages, whoami), who is there (status, hash, stats; users add / remove on a running server, no
+restart; a server older than 0.2.0 without /whoami), the MCP server (no tools unless the session opted in; send /
+read_inbox / ack; the others' names in send's `to`, also after someone is added; tools that appear and go away when the
+session is turned on or off while the server runs), the hooks (silent unless opted in; each message shown once; Stop
+blocks once per message; unreachable or wrong-certificate server: silent and fast), the shipped hooks/hooks.json and MCP
+server entry of plugin.json exactly as Claude Code runs them, switching servers, and non-ASCII text.
 usage: python tests/test_passnote.py <scratch dir>     (the scratch dir is deleted and recreated)"""
 import json
 import os
@@ -12,6 +14,7 @@ import queue
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -21,7 +24,8 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS, SERVER = os.path.join(ROOT, "scripts"), os.path.join(ROOT, "server")
-sys.path.insert(0, SERVER)
+sys.path[:0] = [SERVER, SCRIPTS]
+import client  # noqa: E402
 import server  # noqa: E402
 
 work = os.path.abspath(sys.argv[1])
@@ -46,16 +50,32 @@ def free_port():
 
 TOK = {"alice": "tok-alice-" + "a" * 20, "bob": "tok-bob-" + "b" * 20}
 THREE = ["send", "read_inbox", "ack"]
-with open(os.path.join(work, "tokens.json"), "w") as f:
+TOKENS = os.path.join(work, "tokens.json")
+with open(TOKENS, "w") as f:
     json.dump({k: server.token_hash(v) for k, v in TOK.items()}, f)
+# a passnote 0.1 server, as still deployed: /whoami is unknown to it, like any other path it does not serve
+OLD_SERVER = os.path.join(work, "old_server.py")
+with open(OLD_SERVER, "w") as f:
+    f.write(f"""import sys
+sys.path.insert(0, {SERVER!r})
+import server
+from urllib.parse import urlparse
+get = server.Handler.do_GET
+def do_GET(self):
+    if urlparse(self.path).path == "/whoami":
+        return self.reply(404, {{"error": "not found"}}) if self.user() else self.reply(401, {{"error": "unauthorized"}})
+    return get(self)
+server.Handler.do_GET = do_GET
+server.main()
+""")
 
 
-def start(port, *extra):
+def start(port, *extra, script=os.path.join(SERVER, "server.py"), tokens=TOKENS):
     """Start the server and wait until it accepts connections. The first start of a freshly installed Python can take
     many seconds (macOS scans new binaries), hence the long wait."""
     log = open(os.path.join(work, f"server-{port}.log"), "w")
-    p = subprocess.Popen([PY, os.path.join(SERVER, "server.py"), "serve", "--db", os.path.join(work, f"m{port}.db"),
-                          "--tokens", os.path.join(work, "tokens.json"), "--bind", f"127.0.0.1:{port}", *extra],
+    p = subprocess.Popen([PY, script, "serve", "--db", os.path.join(work, f"m{port}.db"),
+                          "--tokens", tokens, "--bind", f"127.0.0.1:{port}", *extra],
                          stderr=log)
     t0 = time.time()
     while time.time() - t0 < 60 and p.poll() is None:
@@ -86,6 +106,82 @@ def cli(e, *args):
 def api(e, *args):
     code, out, err = cli(e, *args)
     return code, (json.loads(out) if code == 0 and out.strip().startswith(("[", "{")) else out + err)
+
+
+def admin(*args):
+    """server.py's own commands (users, stats), as the person running the server types them -> (exit code, output)."""
+    r = subprocess.run([PY, os.path.join(SERVER, "server.py"), *args], capture_output=True, timeout=20,
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    return r.returncode, r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
+
+
+def users(*args, tokens=TOKENS):
+    return admin("users", "--tokens", tokens, *args)
+
+
+def get(url, path, token):
+    """-> (HTTP status, decoded JSON or None)"""
+    req = urllib.request.Request(url + path, headers={"Authorization": "Bearer " + token})
+    try:
+        return 200, json.loads(urllib.request.urlopen(req, timeout=5).read())
+    except urllib.error.HTTPError as ex:
+        return ex.code, None
+
+
+INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18",
+                                                                       "capabilities": {}, "clientInfo": {"name": "t"}}}
+INITIALIZED = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+
+def mcp(e, msgs):
+    """The MCP server, given msgs on stdin and then end of input -> what it wrote."""
+    p = subprocess.run([PY, os.path.join(SCRIPTS, "mcp_server.py")],
+                       input="".join(json.dumps(m) + "\n" for m in msgs).encode(), env=e, capture_output=True,
+                       timeout=30)
+    return [json.loads(x) for x in p.stdout.decode("utf-8").splitlines() if x.strip()]
+
+
+def to_field(tools):
+    """send's `to` in a tools/list answer"""
+    return next(t for t in tools if t["name"] == "send")["inputSchema"]["properties"]["to"]
+
+
+class Live:
+    """An MCP server that keeps running, as in a Claude Code session."""
+
+    def __init__(self, e):
+        self.p = subprocess.Popen([PY, os.path.join(SCRIPTS, "mcp_server.py")], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, env=e)
+        self.q = queue.Queue()
+        threading.Thread(target=lambda: [self.q.put(json.loads(x)) for x in self.p.stdout if x.strip()],
+                         daemon=True).start()
+
+    def say(self, m):
+        self.p.stdin.write((json.dumps(m) + "\n").encode())
+        self.p.stdin.flush()
+
+    def until(self, pred, wait=10.0):
+        """-> what the running server wrote up to the first message that satisfies pred; None if none came in time"""
+        got_, end = [], time.time() + wait
+        while True:
+            try:
+                got_.append(self.q.get(timeout=max(0.0, end - time.time())))
+            except queue.Empty:
+                return None
+            if pred(got_[-1]):
+                return got_
+
+    def rpc(self, i, method, **params):
+        self.say({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+        return (self.until(lambda m: m.get("id") == i) or [{}])[-1]
+
+    def close(self):
+        self.p.stdin.close()
+        self.p.wait(10)
+        return self.p.returncode
+
+
+changed = lambda m: m.get("method") == "notifications/tools/list_changed"      # noqa: E731
 
 
 def hook(e, mode, sid, **extra):
@@ -163,15 +259,39 @@ try:
           acked_wrong == {"acked": 0} and acked == {"acked": 1} and inbox_b2 == []
           and len(inbox_b3) == 1 and inbox_b3[0]["acked"] is True)
 
+    # 1b. who is there: /whoami, `status` (whom you can send to, your tokens.json line), `hash`, and the server's own
+    # view (`server.py stats`, read-only)
+    w_a, w_bad = get(URL, "/whoami", TOK["alice"]), get(URL, "/whoami", "wrong")
+    st_b = cli(eB, "status")
+    line_b = f'"bob": "{server.token_hash(TOK["bob"])}"'
+    h_b = cli(eB, "hash", "--name", "bob")
+    h_none = cli(eB, "hash")                    # nothing in HOME_B: init never recorded a name
+    st_401 = cli(env("alice", URL, HOME_A, PASSNOTE_TOKEN="wrong"), "status")
+    check("whoami: your name and the others'; status says whom you can send to and prints your tokens.json line, as "
+          "hash does; with a token the server does not know, status says so and still prints the line",
+          w_a == (200, {"user": "alice", "peers": ["bob"]}) and w_bad[0] == 401
+          and "you are bob; you can send to alice" in st_b[1] and line_b in st_b[1] and st_b[0] == 0
+          and h_b[0] == 0 and h_b[1].strip() == line_b and h_none[0] != 0 and "--name" in h_none[2]
+          and st_401[0] != 0 and "401" in st_401[1]
+          and f'"<your name>": "{server.token_hash("wrong")}"' in st_401[1], st_b[1].strip().splitlines()[-2:])
+    db1 = os.path.join(work, f"m{port}.db")
+
+    def db_files(db):
+        return {p: open(p, "rb").read() for p in (db, db + "-wal") if os.path.exists(p)}     # not -shm: readers mark it
+    files_before = db_files(db1)
+    c_st, st_json = admin("stats", "--db", db1, "--tokens", TOKENS, "--json")
+    c_st2, st_table = admin("stats", "--db", db1, "--tokens", TOKENS)
+    stats = json.loads(st_json) if c_st == 0 else {}
+    check("stats: per user unread, received and sent messages and last activity (last sent or acked), registered or "
+          "not; reads the database of a running server without changing it",
+          stats.get("alice") == {"unread": 1, "received": 1, "sent": 1, "last_activity": m1["created_at"],
+                                 "registered": True}
+          and stats.get("bob") == {"unread": 0, "received": 1, "sent": 1, "last_activity": inbox_b3[0]["acked_at"],
+                                   "registered": True}
+          and c_st2 == 0 and "last activity" in st_table and db_files(db1) == files_before, st_table.strip())
+
     # 2. MCP server
-    def mcp(e, msgs):
-        p = subprocess.run([PY, os.path.join(SCRIPTS, "mcp_server.py")],
-                           input="".join(json.dumps(m) + "\n" for m in msgs).encode(), env=e, capture_output=True,
-                           timeout=20)
-        return [json.loads(x) for x in p.stdout.decode("utf-8").splitlines() if x.strip()]
-    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18",
-                                                                       "capabilities": {}, "clientInfo": {"name": "t"}}}
-    seq = [init, {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    seq = [INIT, INITIALIZED,
            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "send", "arguments": {
                "to": "bob", "type": "interface_change", "body": "lens.py 的输出加了 r2_uncalibrated 字段",
@@ -183,11 +303,14 @@ try:
     check("MCP, session not opted in: no tools, calls refused",
           len(off) == 4 and off[0]["result"]["protocolVersion"] == "2025-06-18" and off[1]["result"]["tools"] == []
           and "error" in off[2] and off[3]["result"] == {} and "instructions" not in off[0]["result"])
-    check("MCP, opted in: three tools, send works, one answer per request (none for the notification)",
+    to_on = to_field(on[1]["result"]["tools"])
+    check("MCP, opted in: three tools, send works, one answer per request (none for the notification); send's `to` "
+          "lists the others (an enum) and says who you are",
           [t["name"] for t in on[1]["result"]["tools"]] == ["send", "read_inbox", "ack"] and "id" in sent
           and on[2]["result"]["isError"] is False and [r["id"] for r in on] == [1, 2, 3, 4]
-          and on[0]["result"]["serverInfo"]["name"] == "passnote")
-    rd = mcp(env("bob", URL, HOME_B, PASSNOTE_ENABLE=1), [init, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+          and on[0]["result"]["serverInfo"]["name"] == "passnote"
+          and to_on.get("enum") == ["bob"] and "you are alice" in to_on.get("description", ""), to_on)
+    rd = mcp(env("bob", URL, HOME_B, PASSNOTE_ENABLE=1), [INIT, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                                                                  "params": {"name": "read_inbox", "arguments": {}}},
                                                         {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                                          "params": {"name": "send", "arguments": {"to": "alice"}}}])
@@ -197,53 +320,129 @@ try:
 
     # the session is turned on and off while the MCP server runs (/passnote:enable, /passnote:disable): the server
     # notices and sends notifications/tools/list_changed, after which Claude Code asks for tools/list again
-    live = subprocess.Popen([PY, os.path.join(SCRIPTS, "mcp_server.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            env=env("alice", URL, HOME_A, CLAUDE_CODE_SESSION_ID="sess-live",
-                                    PASSNOTE_MCP_POLL_SECONDS=0.2))
-    out_q = queue.Queue()
-    threading.Thread(target=lambda: [out_q.put(json.loads(x)) for x in live.stdout if x.strip()], daemon=True).start()
-
-    def say(m):
-        live.stdin.write((json.dumps(m) + "\n").encode())
-        live.stdin.flush()
-
-    def until(pred, wait=10.0):
-        """-> what the running server wrote up to the first message that satisfies pred; None if none came in time"""
-        got_, end = [], time.time() + wait
-        while True:
-            try:
-                got_.append(out_q.get(timeout=max(0.0, end - time.time())))
-            except queue.Empty:
-                return None
-            if pred(got_[-1]):
-                return got_
-
-    def rpc(i, method, **params):
-        say({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
-        return (until(lambda m: m.get("id") == i) or [{}])[-1]
-    changed = lambda m: m.get("method") == "notifications/tools/list_changed"      # noqa: E731
+    live = Live(env("alice", URL, HOME_A, CLAUDE_CODE_SESSION_ID="sess-live", PASSNOTE_MCP_POLL_SECONDS=0.2))
     try:
-        caps = rpc(1, "initialize", protocolVersion="2025-06-18")["result"]["capabilities"]
-        say({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        before = rpc(2, "tools/list")["result"]["tools"]
+        caps = live.rpc(1, "initialize", protocolVersion="2025-06-18")["result"]["capabilities"]
+        live.say(INITIALIZED)
+        before = live.rpc(2, "tools/list")["result"]["tools"]
         e_live = env("alice", URL, HOME_A, CLAUDE_CODE_SESSION_ID="sess-live")
         cli(e_live, "enable")
-        n_on = until(changed)
-        tools_on = [t["name"] for t in rpc(3, "tools/list")["result"]["tools"]]
-        call_on = rpc(4, "tools/call", name="read_inbox", arguments={})
+        n_on = live.until(changed)
+        listed_on = live.rpc(3, "tools/list")["result"]["tools"]
+        call_on = live.rpc(4, "tools/call", name="read_inbox", arguments={})
         cli(e_live, "disable")
-        n_off = until(changed)
-        tools_off = rpc(5, "tools/list")["result"]["tools"]
-        call_off = rpc(6, "tools/call", name="read_inbox", arguments={})
-        quiet_after = until(changed, 1.0)
+        n_off = live.until(changed)
+        tools_off = live.rpc(5, "tools/list")["result"]["tools"]
+        call_off = live.rpc(6, "tools/call", name="read_inbox", arguments={})
+        quiet_after = live.until(changed, 1.0)
     finally:
-        live.stdin.close()
-        live.wait(10)
-    check("MCP, session turned on and then off while the server runs: tools/list_changed each time, the tools follow, "
-          "no notification when nothing changed",
-          caps == {"tools": {"listChanged": True}} and before == [] and n_on is not None and tools_on == THREE
+        live_rc = live.close()
+    check("MCP, session turned on and then off while the server runs: tools/list_changed each time, the tools follow "
+          "(with the others' names), no notification when nothing changed",
+          caps == {"tools": {"listChanged": True}} and before == [] and n_on is not None
+          and [t["name"] for t in listed_on] == THREE and to_field(listed_on).get("enum") == ["bob"]
           and call_on["result"]["isError"] is False and n_off is not None and tools_off == []
-          and "error" in call_off and quiet_after is None and live.returncode == 0)
+          and "error" in call_off and quiet_after is None and live_rc == 0)
+
+    # 2b. managing users on the running server: tokens.json is rewritten atomically and read again by the server, no
+    # restart; a running MCP server offers a new name after its next tool call
+    TOK["carol"] = "tok-carol-" + "c" * 20
+    eC = env("carol", URL, os.path.join(work, "home_carol"))
+    mode_before = os.stat(TOKENS).st_mode & 0o777
+    list0 = users("list")
+    carol_before = cli(eC, "inbox")[0]
+    live = Live(env("alice", URL, HOME_A, PASSNOTE_ENABLE=1))
+    try:
+        live.rpc(1, "initialize", protocolVersion="2025-06-18")
+        live.say(INITIALIZED)
+        to_before = to_field(live.rpc(2, "tools/list")["result"]["tools"])
+        added = users("add", "carol", server.token_hash(TOK["carol"]).upper())     # upper-case hex is fine too
+        carol_after = api(eC, "inbox")
+        live.rpc(3, "tools/call", name="read_inbox", arguments={})
+        n_names = live.until(changed)
+        to_after = to_field(live.rpc(4, "tools/list")["result"]["tools"])
+        to_carol = live.rpc(5, "tools/call", name="send", arguments={"to": "carol", "type": "info", "body": "欢迎"})
+    finally:
+        live.close()
+    check("users add: the running server accepts the new token at once; a running MCP server lists the new name after "
+          "its next call (tools/list_changed); list prints tokens.json lines; the file keeps its mode",
+          list0[0] == 0 and line_b in list0[1] and carol_before != 0 and added[0] == 0
+          and carol_after[0] == 0 and carol_after[1] == [] and to_before.get("enum") == ["bob"] and n_names is not None
+          and to_after.get("enum") == ["bob", "carol"] and to_carol["result"]["isError"] is False
+          and os.stat(TOKENS).st_mode & 0o777 == mode_before, added[1].strip())
+    h_dave = server.token_hash("tok-dave-" + "d" * 20)
+    raw = open(TOKENS, "rb").read()
+    refused = [users("add", "bad name", h_dave), users("add", "--", "-dave", h_dave), users("add", "d" * 41, h_dave),
+               users("add", "名字", h_dave), users("add", "dave", "xyz"), users("add", "dave", h_dave[:63]),
+               users("add", "dave", TOK["alice"]),                          # a token instead of its hash
+               users("add", "dave", server.token_hash(TOK["carol"])),       # somebody else's hash
+               users("add", "bob", h_dave),                                 # bob is there: needs --replace
+               users("remove", "nobody")]
+    check("users: bad names and hashes, a hash that is someone else's, an existing name without --replace and an "
+          "unknown name are refused, and tokens.json stays as it was",
+          all(r[0] != 0 for r in refused) and open(TOKENS, "rb").read() == raw,
+          " | ".join(r[1].strip()[-45:] for r in refused))
+    TOK2 = "tok-carol-new-" + "e" * 20
+    replaced = users("add", "carol", server.token_hash(TOK2), "--replace")
+    old_tok, new_tok = cli(eC, "inbox")[0], cli(dict(eC, PASSNOTE_TOKEN=TOK2), "inbox")[0]
+    good = open(TOKENS, "rb").read()
+    with open(TOKENS, "w") as f:
+        f.write('{"alice": ')                   # an edit by hand, saved half way
+    during = get(URL, "/whoami", TOK["alice"])
+    with open(TOKENS, "wb") as f:
+        f.write(good)
+    removed = users("remove", "carol")
+    after_rm = cli(dict(eC, PASSNOTE_TOKEN=TOK2), "inbox")[0]
+    srv_log = open(os.path.join(work, f"server-{port}.log"), encoding="utf-8").read()
+    check("users add --replace swaps the hash (old token refused, new one accepted); a broken tokens.json is reported "
+          "in the log and the previous users stay; users remove: the token is refused at once",
+          replaced[0] == 0 and old_tok != 0 and new_tok == 0 and during == (200, {"user": "alice",
+                                                                                 "peers": ["bob", "carol"]})
+          and "tokens.json not reloaded" in srv_log and removed[0] == 0 and after_rm != 0
+          and get(URL, "/whoami", TOK["alice"]) == (200, {"user": "alice", "peers": ["bob"]}))
+
+    # a server started with nobody in tokens.json, filled while it runs; and users add creating tokens.json
+    empty_tokens = os.path.join(work, "tokens_empty.json")
+    with open(empty_tokens, "w") as f:
+        f.write("{}")
+    new_tokens = os.path.join(work, "new", "tokens.json")
+    os.makedirs(os.path.dirname(new_tokens))
+    created = users("add", "dave", h_dave, tokens=new_tokens)
+    port3 = free_port()
+    srv3 = start(port3, tokens=empty_tokens)
+    try:
+        U3 = f"http://127.0.0.1:{port3}"
+        nobody = get(U3, "/whoami", "tok-dave-" + "d" * 20)
+        users("add", "dave", h_dave, tokens=empty_tokens)
+        e_dave = dict(env("alice", U3, os.path.join(work, "home_dave")), PASSNOTE_TOKEN="tok-dave-" + "d" * 20)
+        st_dave = cli(e_dave, "status")
+    finally:
+        srv3.terminate()
+    check("users add creates a missing tokens.json (mode 600); a server can start with nobody registered and accept "
+          "people added later; status when you are the only one",
+          created[0] == 0 and json.load(open(new_tokens)) == {"dave": h_dave}
+          and (os.name == "nt" or os.stat(new_tokens).st_mode & 0o777 == 0o600)
+          and nobody[0] == 401 and "you are dave; nobody else is registered on this server yet" in st_dave[1],
+          st_dave[1].strip().splitlines()[-2:])
+
+    # 2c. a server older than 0.2.0 (no /whoami), like the ones already running: the new client still works with it
+    port4 = free_port()
+    srv4 = start(port4, script=OLD_SERVER)
+    try:
+        U4 = f"http://127.0.0.1:{port4}"
+        old_404 = get(U4, "/whoami", TOK["alice"])
+        st_old = cli(env("alice", U4, HOME_A), "status")
+        old = mcp(env("alice", U4, HOME_A, PASSNOTE_ENABLE=1), seq)
+        old_in = api(env("bob", U4, HOME_B), "inbox")
+    finally:
+        srv4.terminate()
+    to_old = to_field(old[1]["result"]["tools"]) if len(old) == 4 else {}
+    check("server without /whoami: status names you and says the others are unknown; send's `to` is free text that "
+          "says who you are; send and inbox work",
+          old_404[0] == 404 and st_old[0] == 0 and "you are alice; the others are unknown" in st_old[1]
+          and "enum" not in to_old and "you are alice" in to_old.get("description", "")
+          and old[2]["result"]["isError"] is False and old_in[0] == 0 and len(old_in[1]) == 1,
+          f"{st_old[1].strip().splitlines()[-2:]} {to_old}")
 
     # 3. opting in, and the hooks (bob's side: one unread message from alice, id sent["id"])
     r_off = hook(eB, "prompt", sid)
@@ -294,14 +493,22 @@ try:
     d1, b1 = hook(dead, "prompt", sid), hook(blackhole, "stop", sid)
     check("server down or unroutable: no output, exit 0, under 2.5 s", d1[0] is None and b1[0] is None and d1[1] == 0
           and b1[1] == 0 and d1[2] < 2.5 and b1[2] < 2.5, f"{d1[2]:.2f} s / {b1[2]:.2f} s")
-    p_mcp = subprocess.run([PY, os.path.join(SCRIPTS, "mcp_server.py")],
-                           env=env("alice", "http://10.255.255.1:8765", HOME_A, PASSNOTE_ENABLE=1),
-                           input=(json.dumps(init) + "\n" + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                                  "params": {"name": "read_inbox", "arguments": {}}}) + "\n").encode(),
-                           capture_output=True, timeout=30)
-    r_m = [json.loads(x) for x in p_mcp.stdout.decode().splitlines()]
-    check("MCP with the server down: a tool error saying so", r_m[1]["result"]["isError"] is True
-          and "unreachable" in r_m[1]["result"]["content"][0]["text"])
+    down = Live(env("alice", "http://10.255.255.1:8765", HOME_A, PASSNOTE_ENABLE=1))
+    try:
+        down.rpc(1, "initialize", protocolVersion="2025-06-18")
+        down.say(INITIALIZED)
+        t0 = time.time()
+        listed_down = down.rpc(2, "tools/list")["result"]["tools"]
+        t_list = time.time() - t0
+        call_down = down.rpc(3, "tools/call", name="read_inbox", arguments={})
+    finally:
+        down.close()
+    to_down = to_field(listed_down)
+    check("MCP with the server down: the tools are listed within the 2 s limit for asking who is there, `to` without "
+          "names; a call gives a tool error saying so",
+          [t["name"] for t in listed_down] == THREE and "enum" not in to_down and t_list < 3
+          and call_down["result"]["isError"] is True and "unreachable" in call_down["result"]["content"][0]["text"],
+          f"tools/list {t_list:.2f} s")
 
     # 5. the shipped plugin configuration, run as Claude Code runs it: the hook commands of hooks/hooks.json through
     # bash with ${CLAUDE_PLUGIN_ROOT} substituted (session id only in the hook input, since CLAUDE_CODE_SESSION_ID is not
@@ -384,7 +591,7 @@ try:
             e["PATH"] = path
         try:
             r = subprocess.run([command, *map(plugin_root, mcfg.get("args", []))], cwd=work, env=e,
-                               input=(json.dumps(init) + "\n" + json.dumps(
+                               input=(json.dumps(INIT) + "\n" + json.dumps(
                                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n").encode(),
                                capture_output=True, timeout=30)
         except OSError as ex:
@@ -412,9 +619,24 @@ try:
           f"{r_conda[1].strip()[-120:]} | {r_py[1].strip()[-120:]} | {r_env[1].strip()[-120:]}")
 finally:
     srv.terminate()
+    srv.wait(10)
+
+# stats of a database nobody has open (the server stopped, or passnote.db copied to a new machine): read without
+# leaving -wal / -shm files behind, the same numbers as before
+moved = os.path.join(work, "moved")
+os.makedirs(moved)
+src, dst = sqlite3.connect(db1), sqlite3.connect(os.path.join(moved, "passnote.db"))
+src.backup(dst)
+dst.close()
+src.close()
+s_old = admin("stats", "--db", db1, "--tokens", TOKENS, "--json")
+s_moved = admin("stats", "--db", os.path.join(moved, "passnote.db"), "--tokens", TOKENS, "--json")
+check("stats of a database nobody has open: works, same numbers, no files created",
+      s_old[0] == 0 and s_moved[0] == 0 and json.loads(s_moved[1]) == json.loads(s_old[1])
+      and json.loads(s_old[1])["alice"]["sent"] >= 2 and os.listdir(moved) == ["passnote.db"], os.listdir(moved))
 
 # 6. the plugin's files agree with each other: every ${CLAUDE_PLUGIN_ROOT}/... path exists, skills are named after their
-# directory, the manifest and the MCP server have the same version
+# directory, the manifest and the MCP server have the same version, the server and the client accept the same names
 refs, names = set(), []
 for dirpath, _, files in os.walk(ROOT):
     for fn in files:
@@ -427,8 +649,10 @@ manifest = json.load(open(os.path.join(ROOT, ".claude-plugin", "plugin.json"), e
 mcp_version = re.search(r'^VERSION = "([^"]+)"', open(os.path.join(SCRIPTS, "mcp_server.py"), encoding="utf-8").read(),
                         re.M).group(1)
 missing = [r for r in refs if not os.path.isfile(os.path.join(ROOT, r))]
-check("plugin files: referenced scripts exist, skill names match their directories, versions agree",
-      refs and not missing and names and all(a == b for a, b in names) and manifest["version"] == mcp_version,
+check("plugin files: referenced scripts exist, skill names match their directories, versions agree, server.py users "
+      "add and client.py init accept the same names",
+      refs and not missing and names and all(a == b for a, b in names) and manifest["version"] == mcp_version
+      and server.NAME.pattern == client.NAME.pattern,
       f"missing {missing}" if missing else f"({len(refs)} paths, {len(names)} skills, version {mcp_version})")
 
 # 7. HTTPS with a self-signed certificate (pinned via PASSNOTE_CA or PASSNOTE_HOME/ca.pem)
@@ -460,6 +684,22 @@ if made:
               "a missing certificate file is reported; a silent client blocks nobody",
               t_send < 5 and c == 0 and "id" in res and c2 != 0 and "CERTIFICATE" in err2.upper() and hk[0] is None
               and c4 != 0 and "not found" in err4 and c3 == 0 and res3[-1]["body"] == "tls ok")
+
+        # switching servers: init again with the new address and certificate; token and name stay, so a new server
+        # that got the old tokens.json (here: the same file) knows you at once
+        home_sw = os.path.join(work, "home_switch")
+        e_sw = {k: v for k, v in env("alice", URL, home_sw).items() if k not in ("PASSNOTE_TOKEN", "PASSNOTE_URL")}
+        c5, out5, _ = cli(e_sw, "init", "--name", "erin", "--url", URL)        # the first server, stopped by now
+        line5 = out5.strip().splitlines()[-1]
+        users("add", "erin", line5.split('"')[3])
+        c6, out6, _ = cli(e_sw, "init", "--name", "erin", "--url", U2, "--ca", cert)
+        st_sw = cli(e_sw, "status")
+        users("remove", "erin")
+        check("switching servers: init with the new URL and certificate keeps the token, so the new server knows you "
+              "with the old tokens.json; status shows the new server and whom you can send to",
+              c5 == 0 and c6 == 0 and out6.strip().splitlines()[-1] == line5 and f"url {U2}," in st_sw[1]
+              and "you are erin; you can send to alice, bob" in st_sw[1] and st_sw[0] == 0,
+              st_sw[1].strip().splitlines()[-2:])
     finally:
         srv2.terminate()
 else:
@@ -483,5 +723,13 @@ check("init: token saved locally and never printed; prints the tokens.json line 
       and cfg1["url"] == "https://example.org:8765" and "ca" not in cfg1
       and open(os.path.join(HOME_N, "ca.pem")).read() == "not really a certificate\n"
       and os.path.join(HOME_N, "ca.pem") in st[1])
+h_n = cli(eN, "hash")
+h_other = cli(eN, "hash", "--name", "carol2")
+bad_init = cli(eN, "init", "--name", "carol smith")
+check("init records your name; hash prints the same line again (or for another name), token untouched; a name "
+      "server.py users add would refuse is refused",
+      cfg1.get("name") == "carol" and h_n[0] == 0 and h_n[1].strip() == f'"carol": "{server.token_hash(cfg1["token"])}"'
+      and h_other[1].strip() == f'"carol2": "{server.token_hash(cfg1["token"])}"' and bad_init[0] != 0
+      and "bad name" in bad_init[2] and json.load(open(os.path.join(HOME_N, "config.json"))) == cfg1)
 print("ALL PASS" if ok else "SOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

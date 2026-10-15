@@ -17,6 +17,7 @@ Claude Code（Alice 的笔记本）─┐                              ┌─ Cl
 - **按会话开启**：默认关闭，只在你开启的会话里生效。
   - 其他会话里看不到工具，hooks 不输出任何内容，也不联网。
   - hooks 在几行 bash 里就退出，不启动 Python。
+- **看得到有谁**：`/passnote:status` 显示服务端地址、你的名字和你能发给谁；`send` 工具里也列着这些名字。
 
 ## 需要
 
@@ -38,13 +39,17 @@ Claude Code（Alice 的笔记本）─┐                              ┌─ Cl
    /passnote:init alice https://203.0.113.5:8765 /path/to/server-cert.pem
    ```
    - token 在你的电脑上生成，存进 `~/.config/claude-passnote/config.json`。不会打印出来，也不会离开这台电脑。
-   - 命令会打印一行 `"alice": "<64 位十六进制>"`。这是 token 的 SHA-256，不是秘密，发给管理服务端的人即可。
+   - 命令会打印一行 `"alice": "<64 位十六进制>"`。这是 token 的 SHA-256，不是秘密，发给管理服务端的人，由他登记（见[管理用户](#管理用户)）。
    - 服务端用的如果是公共 CA 签发的证书（比如 Let's Encrypt），不用给证书参数。
+   - 名字只能用 1 到 40 个 ASCII 字母、数字、`.`、`_`、`-`。
 4. **在要用的会话里开启**：
    - `/passnote:enable` 只开启当前会话。hooks 马上生效；MCP 工具几秒内自动出现，不用重启。
    - 也可以带着 `PASSNOTE_ENABLE=1` 新开一个专门的会话，比如 `PASSNOTE_ENABLE=1 claude`，或者桌面版里一个带这个变量的会话预设。
    - 不要把 `PASSNOTE_ENABLE=1` 设成全局变量，否则所有会话都会开启 passnote。
-5. **检查**：`/passnote:status`。
+5. **检查**：`/passnote:status`。它会显示服务端地址、服务端是否在线、你在上面的名字，以及你能发给谁：
+   ```
+   you are alice; you can send to bob, carol
+   ```
 
 其他命令：
 - `/passnote:disable`：在本会话关闭 passnote。
@@ -59,13 +64,14 @@ Claude Code（Alice 的笔记本）─┐                              ┌─ Cl
    ssh you@203.0.113.5 'mkdir -p ~/passnote && chmod 700 ~/passnote'
    scp server/server.py server/run.sh you@203.0.113.5:~/passnote/
    ```
-2. 登记用户：把大家发来的哈希行（快速开始第 3 步）写进 `~/passnote/tokens.json`，然后执行 `chmod 600 tokens.json`：
-   ```json
-   {"alice": "<alice 的哈希>", "bob": "<bob 的哈希>"}
+2. 登记用户：大家发来的每一行哈希（快速开始第 3 步），都在服务器上运行一次：
+   ```bash
+   cd ~/passnote && python3 server.py users add alice <alice 的哈希>
    ```
+   - 它会写 `server.py` 旁边的 `tokens.json`（权限 600），内容是名字到哈希的对照：`{"alice": "<哈希>", "bob": "<哈希>"}`。也可以手写这个文件。
    - 服务端只存哈希。每条消息的发件人由 token 决定，所以谁也没法冒用别人的名字发消息。
    - 另一种做法：`python3 server.py gen-token NAME` 会打印一个新 token 和对应的那一行，但你得把 token 私下交给本人。
-   - 改了 `tokens.json` 之后要重启服务。
+   - 以后加人可以在服务运行时直接加，见[管理用户](#管理用户)。
 3. 生成证书。自签名就行，可以直接用 IP 当证书名字：
    ```bash
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
@@ -94,10 +100,50 @@ Claude Code（Alice 的笔记本）─┐                              ┌─ Cl
    应该返回 `{"ok": true}`。
 7. 备份（可选）：`sqlite3 ~/passnote/passnote.db ".backup ~/passnote/backup.db"`。
 
+### 管理用户
+
+在服务器的 `~/passnote` 目录里：
+
+| 命令 | 作用 |
+|---|---|
+| `python3 server.py users list` | 列出已登记的人，格式和 `tokens.json` 的行一样 |
+| `python3 server.py users add NAME HASH` | 用 `/passnote:init` 给对方打印的那一行登记一个人。名字已经在了的话，加 `--replace` 才会换哈希 |
+| `python3 server.py users remove NAME` | 删掉一个人。发给他的和他发的消息都还留在数据库里 |
+| `python3 server.py stats` | 每个人的未读、收到、发出的消息数，以及最后一次发消息或 ack 的时间。只读数据库，不改它 |
+
+- `tokens.json` 一改，运行中的服务就会重新读取，所以上面这些都不用重启。手改也一样。文件解析不了时（比如手改到一半就保存了），服务继续用之前的名单，并在日志里写明。
+- `users` 一步写完 `tokens.json`，并保留它原来的属主和权限，所以服务以别的用户运行时，用 root 执行也没问题。
+- 这些命令默认用 `server.py` 旁边的 `tokens.json` 和 `passnote.db`，用 `--tokens`、`--db` 可以指定别的。
+
 换 token：
 1. 删掉那台电脑上 `config.json` 里的 `token`，重新运行 `/passnote:init`。
-2. 替换 `tokens.json` 里对应的那一行。
-3. 重启服务。
+2. 在服务器上：`python3 server.py users add NAME <新哈希> --replace`。
+
+更新服务端：把新的 `server.py` 拷过去，重启一次即可。不同版本的客户端和服务端可以互通；服务端早于 0.2.0 时，`/passnote:status` 列不出其他人。
+
+## 换服务器或迁移服务器
+
+token 是在你自己电脑上生成的，不属于哪台服务器，所以换服务器从来不用换 token。
+
+**每个人**：服务器换了地址或证书后，用新的地址和证书重新运行 `/passnote:init`：
+```
+/passnote:init alice https://198.51.100.7:8765 /path/to/new-cert.pem
+```
+- token 和名字都不变，只改地址和证书。已经在运行的会话，下一次调用就会用新服务器。
+- `/passnote:status` 会显示你用的是哪台服务器，以及在那里能发给谁。
+- 新服务器还不认识你时（`server said 401`），把你的哈希行再发给管理它的人。`/passnote:init` 和 `/passnote:status` 都会打印这一行，`client.py hash` 也会。
+
+**管理服务端的人**，把服务迁到另一台机器：
+1. 准备新机器：[部署服务端](#部署服务端)的第 1、4、5 步。
+2. 停掉旧服务，免得拷完之后又有消息进来：`kill $(cat ~/passnote/server.pid)`，并删掉对应的 cron 行（或者 `sudo systemctl disable --now passnote`）。不删的话，cron 5 分钟内会把它重新拉起来。
+3. 把 `tokens.json` 和数据库拷到新机器：`passnote.db`，有 `passnote.db-wal` 的话连它一起拷。SQLite 会先把最新的消息存在 `-wal` 文件里，之后才合并进主文件。这样大家的登记都还在，未读消息也还是未读。
+   ```bash
+   cd ~/passnote && scp tokens.json passnote.db passnote.db-wal you@198.51.100.7:~/passnote/
+   ```
+4. 证书：自签名证书里写的是服务器的 IP，所以**换了 IP 就要生成新证书**（[部署服务端](#部署服务端)第 3 步），并把新的 `cert.pem` 发给每个人。如果用的是跟着迁过去的域名，或者公共 CA 签发的证书，就把 `cert.pem` 和 `key.pem` 一起拷过去；地址不变的话，客户端什么都不用改。
+5. 启动新服务，用 `curl` 检查一下（第 6 步），再把新地址和证书告诉大家。
+
+如果是从头搭一台新服务器，跳过第 3 步即可：每个人重新发一次自己的哈希行，旧消息留在旧服务器上。
 
 ## 配置
 
@@ -148,7 +194,7 @@ Claude Code（Alice 的笔记本）─┐                              ┌─ Cl
 |---|---|
 | `id` | 服务端分配 |
 | `from` | 发送这条消息的 token 的主人，无法伪造 |
-| `to` | 收件人名字，即 `tokens.json` 里的名字 |
+| `to` | 收件人名字，即 `tokens.json` 里的名字。`send` 工具和 `/passnote:status` 会列出这些名字 |
 | `type` | `info`（通知，不用回）、`request`（请对方做事）、`interface_change`（别人会用到的东西改了）、`claim`（认领任务）、`done`（做完了） |
 | `body` | 最多 1000 字。写几行就好，细节写进项目里的文件 |
 | `refs` | 最多 10 条：commit SHA、文件路径 |
@@ -188,8 +234,10 @@ agent 会遵守 passnote 自带的提示。在项目的 `CLAUDE.md` 里加一小
 |---|---|
 | 收不到消息 | 运行 `/passnote:status`：本会话开启了吗？配置了吗？服务端在线吗？ |
 | hooks 什么都不说 | 服务端连不上或太慢时，hooks 会静默跳过，不卡会话，这是设计如此 |
-| `server said 401` | 服务端还不知道你的 token 哈希：把 `init` 打印的那一行发给管理服务端的人 |
-| 证书错误 | `init` 时给的证书和服务端现在用的不一致：用新证书重新运行 `/passnote:init <名字> <地址> <新证书>` |
+| `server said 401` | 服务端还不知道你的 token 哈希：把 `/passnote:status` 打印的那一行发给管理服务端的人，由他运行 `server.py users add` |
+| 证书错误 | `init` 时给的证书和服务端现在用的不一致，比如服务器迁移了：用新证书重新运行 `/passnote:init <名字> <地址> <新证书>` |
+| `/passnote:status` 说其他人未知（the others are unknown） | 服务端的 passnote 早于 0.2.0。收发消息不受影响；想列出其他人，就更新它的 `server.py` 并重启一次 |
+| `send` 里没有刚加进来的人 | `send` 工具下一次访问服务端之后才会知道新名字。在那之前可以用 `/passnote:mail` 发给他 |
 | `passnote` 的 MCP 服务启动失败 | `PATH` 里找不到 Python 3.9+，`/mcp` 里能看到报错。装上 Python，或者设置 `PASSNOTE_PYTHON`（见[用的是哪个 Python](#用的是哪个-python)） |
 | `/mcp` 里 passnote 显示 `connected · no tools` | 本会话还没开启 passnote。运行 `/passnote:enable`：MCP 服务每 2 秒检查一次，发现开启了就通知 Claude Code，几秒内工具就会加载。还是没有的话，在 `/mcp` 里选 `plugin:passnote:passnote`，再选 Reconnect。在那之前可以用 `/passnote:mail` |
 
