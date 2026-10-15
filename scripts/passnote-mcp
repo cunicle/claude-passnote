@@ -1,0 +1,11 @@
+#!/bin/sh
+# Starts the passnote MCP server with the first Python 3.9+ it finds: $PASSNOTE_PYTHON, then python3, then python.
+# The plugin's MCP command is ${CLAUDE_PLUGIN_ROOT}/scripts/passnote-mcp: on macOS and Linux this file runs, on Windows
+# passnote-mcp.cmd next to it does the same. Nothing may be written to stdout before the server starts.
+dir="${0%/*}"
+for py in "$PASSNOTE_PYTHON" python3 python; do
+  [ -n "$py" ] && "$py" -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1 &&
+    exec "$py" "$dir/mcp_server.py"
+done
+echo "passnote: no Python 3.9+ found (tried \$PASSNOTE_PYTHON, python3, python); set PASSNOTE_PYTHON to one" >&2
+exit 1

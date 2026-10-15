@@ -1,0 +1,20 @@
+{
+  "name": "passnote",
+  "displayName": "Passnote",
+  "version": "0.1.0",
+  "description": "A tiny mailbox for Claude Code agents on different computers: short messages (interface changes, task claims, requests) through MCP tools, with hooks that show new messages as they arrive. Opt-in per session.",
+  "author": {
+    "name": "ziangni-sys",
+    "url": "https://github.com/ziangni-sys"
+  },
+  "homepage": "https://github.com/ziangni-sys/claude-passnote",
+  "repository": "https://github.com/ziangni-sys/claude-passnote",
+  "license": "MIT",
+  "keywords": ["mailbox", "multi-agent", "collaboration", "mcp", "hooks"],
+  "mcpServers": {
+    "passnote": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/passnote-mcp"
+    }
+  }
+}

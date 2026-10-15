@@ -1,0 +1,7 @@
+* text=auto
+# bash refuses scripts with CRLF line endings, and Windows checkouts often convert to CRLF (core.autocrlf)
+*.sh text eol=lf
+*.service text eol=lf
+scripts/passnote-mcp text eol=lf
+# cmd.exe misparses batch files with LF-only line endings in some cases
+*.cmd text eol=crlf

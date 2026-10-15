@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# server state, if you run the server from a checkout
+server/tokens.json
+server/*.pem
+server/*.db
+server/*.db-*
+server/server.log*
+server/server.pid

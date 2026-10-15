@@ -1,0 +1,15 @@
+{
+  "name": "passnote",
+  "owner": {
+    "name": "ziangni-sys",
+    "url": "https://github.com/ziangni-sys"
+  },
+  "description": "Passnote: a tiny mailbox for Claude Code agents on different computers.",
+  "plugins": [
+    {
+      "name": "passnote",
+      "source": "./",
+      "description": "Short messages between Claude Code agents through MCP tools, with hooks that show new messages as they arrive. Opt-in per session."
+    }
+  ]
+}
