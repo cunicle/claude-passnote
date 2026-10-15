@@ -48,16 +48,23 @@ with open(os.path.join(work, "tokens.json"), "w") as f:
 
 
 def start(port, *extra):
+    """Start the server and wait until it accepts connections. The first start of a freshly installed Python can take
+    many seconds (macOS scans new binaries), hence the long wait."""
+    log = open(os.path.join(work, f"server-{port}.log"), "w")
     p = subprocess.Popen([PY, os.path.join(SERVER, "server.py"), "serve", "--db", os.path.join(work, f"m{port}.db"),
                           "--tokens", os.path.join(work, "tokens.json"), "--bind", f"127.0.0.1:{port}", *extra],
-                         stderr=subprocess.DEVNULL)
-    for _ in range(100):
+                         stderr=log)
+    t0 = time.time()
+    while time.time() - t0 < 60 and p.poll() is None:
         try:
             socket.create_connection(("127.0.0.1", port), 0.2).close()
             return p
         except OSError:
-            time.sleep(0.05)
-    raise RuntimeError("server did not start")
+            time.sleep(0.1)
+    p.kill()
+    log.close()
+    raise RuntimeError(f"server did not start (exit code {p.poll()}): "
+                       + open(os.path.join(work, f"server-{port}.log")).read()[-2000:])
 
 
 def env(user, url, home, **kw):
@@ -312,8 +319,9 @@ try:
                           encoding="utf-8"))["mcpServers"]["passnote"]
     raw = json.dumps(mcfg)
     command = plugin_root(mcfg["command"])
-    if os.name == "nt":
-        command = shutil.which(command) or command
+    if os.name == "nt":     # PATHEXT lookup (shutil.which before Python 3.12 returns the extensionless sh script)
+        command = next((command + ext for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+                        if ext and os.path.isfile(command + ext)), command)
     system_path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32") if os.name == "nt" else ""
 
     def launch(path=None, **kw):
