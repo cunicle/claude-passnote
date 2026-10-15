@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """MCP server (stdio, standard library only) wrapping passnote: tools send, read_inbox, ack. Registered in the plugin's
-.mcp.json. In a session that has not opted in (client.py: PASSNOTE_ENABLE=1 or `client.py enable`, checked when the
-server starts) it offers no tools at all, so other conversations are not touched.
+plugin.json. In a session that has not opted in (client.py: PASSNOTE_ENABLE=1 or `client.py enable`) it offers no tools
+at all, so other conversations are not touched. While the session runs it checks every PASSNOTE_MCP_POLL_SECONDS
+(default 2) whether `client.py enable` or `disable` changed that, and if so tells Claude Code
+(notifications/tools/list_changed), which then fetches the tool list again: the tools appear and go away without a
+restart.
 """
 import json
 import os
 import sys
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import client  # noqa: E402
@@ -44,6 +49,9 @@ TOOLS = [
          "ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1}}, "required": ["ids"]}},
 ]
 ACTIVE = client.enabled()
+POLL = float(os.environ.get("PASSNOTE_MCP_POLL_SECONDS") or 2)
+_out = threading.Lock()
+_watching = []
 
 
 def run_tool(name, a):
@@ -57,16 +65,45 @@ def run_tool(name, a):
     raise KeyError(name)
 
 
+def write(msg):
+    with _out:
+        sys.stdout.buffer.write((json.dumps(msg) + "\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+
+
+def watch():
+    """Follow `client.py enable` / `disable` for this session: on a change, offer the tools (or none) from now on and
+    tell the client to list them again."""
+    global ACTIVE
+    while True:
+        time.sleep(POLL)
+        now = client.enabled()
+        if now != ACTIVE:
+            ACTIVE = now
+            write({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+
+
+def start_watching():
+    # PASSNOTE_ENABLE=0/1 or no session id: the answer cannot change while the server runs
+    if _watching or os.environ.get("PASSNOTE_ENABLE", "") in ("0", "1") or not client.session_id():
+        return
+    _watching.append(threading.Thread(target=watch, daemon=True))
+    _watching[0].start()
+
+
 def handle(msg):
     method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
     if method == "initialize":
         want = params.get("protocolVersion")
         result = {"protocolVersion": want if want in VERSIONS else VERSIONS[0],
-                  "capabilities": {"tools": {"listChanged": False}},
+                  "capabilities": {"tools": {"listChanged": True}},
                   "serverInfo": {"name": "passnote", "version": VERSION}}
         if ACTIVE:
             result["instructions"] = "Passnote: a mailbox between Claude Code agents. " + RULES
         return result
+    if method == "notifications/initialized":
+        start_watching()
+        return None
     if method == "ping":
         return {}
     if method == "tools/list":
@@ -82,7 +119,7 @@ def handle(msg):
         except (KeyError, TypeError, ValueError) as e:
             out, err = f"bad arguments: {e}", True
         return {"content": [{"type": "text", "text": out}], "isError": err}
-    if mid is None:             # a notification (notifications/initialized, cancelled, ...): no answer
+    if mid is None:             # another notification (cancelled, ...): no answer
         return None
     raise NotImplementedError(method)
 
@@ -110,8 +147,7 @@ def main():
             resp = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": str(e)}}
         except Exception as e:  # keep serving
             resp = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(e)}}
-        sys.stdout.buffer.write((json.dumps(resp) + "\n").encode("utf-8"))
-        sys.stdout.buffer.flush()
+        write(resp)
 
 
 if __name__ == "__main__":

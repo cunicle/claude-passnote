@@ -201,9 +201,8 @@ def main():
                 sys.exit("no session id: run this inside a Claude Code session or pass --session")
             _set_session(sid, a.cmd == "enable")
             print(f"passnote {a.cmd}d for session {sid} ({os.path.join(home(), 'sessions')}); the hooks take effect at "
-                  f"once, the MCP tools {'appear' if a.cmd == 'enable' else 'go away'} after the session restarts (in a "
-                  f"terminal: /exit, then `claude --resume {sid}`; --continue resumes the latest session of the current "
-                  "directory, which may be another one)")
+                  f"once, the MCP tools {'appear' if a.cmd == 'enable' else 'go away'} within a few seconds, without a "
+                  "restart (if they do not, select plugin:passnote:passnote in /mcp and choose Reconnect)")
         elif a.cmd == "status":
             c, sid = config(), session_id(a.session)
             print(f"session {sid or '-'}: enabled {enabled(sid)}, configured {configured()}\n"

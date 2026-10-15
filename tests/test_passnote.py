@@ -1,18 +1,20 @@
 """Local end-to-end test of passnote (server/server.py, scripts/client.py, mcp_server.py, hook.py, hook.sh and the
 plugin's own configuration): starts the real server on 127.0.0.1 (plain HTTP, and HTTPS with a self-signed certificate
 when openssl can make one) with a temporary database, then checks the API (auth, sender from the token, validation,
-reply_to, ack only own messages), the MCP server (no tools unless the session opted in; send / read_inbox / ack), the
-hooks (silent unless opted in; each message shown once; Stop blocks once per message; unreachable or wrong-certificate
-server: silent and fast), the shipped hooks/hooks.json and MCP server entry of plugin.json exactly as Claude Code runs
-them, and non-ASCII text.
+reply_to, ack only own messages), the MCP server (no tools unless the session opted in; send / read_inbox / ack; tools
+that appear and go away when the session is turned on or off while the server runs), the hooks (silent unless opted in;
+each message shown once; Stop blocks once per message; unreachable or wrong-certificate server: silent and fast), the
+shipped hooks/hooks.json and MCP server entry of plugin.json exactly as Claude Code runs them, and non-ASCII text.
 usage: python tests/test_passnote.py <scratch dir>     (the scratch dir is deleted and recreated)"""
 import json
 import os
+import queue
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -43,6 +45,7 @@ def free_port():
 
 
 TOK = {"alice": "tok-alice-" + "a" * 20, "bob": "tok-bob-" + "b" * 20}
+THREE = ["send", "read_inbox", "ack"]
 with open(os.path.join(work, "tokens.json"), "w") as f:
     json.dump({k: server.token_hash(v) for k, v in TOK.items()}, f)
 
@@ -192,6 +195,56 @@ try:
     check("MCP read_inbox returns the message; bad arguments give a tool error, not a crash",
           len(got) == 1 and got[0]["type"] == "interface_change" and rd[2]["result"]["isError"] is True)
 
+    # the session is turned on and off while the MCP server runs (/passnote:enable, /passnote:disable): the server
+    # notices and sends notifications/tools/list_changed, after which Claude Code asks for tools/list again
+    live = subprocess.Popen([PY, os.path.join(SCRIPTS, "mcp_server.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            env=env("alice", URL, HOME_A, CLAUDE_CODE_SESSION_ID="sess-live",
+                                    PASSNOTE_MCP_POLL_SECONDS=0.2))
+    out_q = queue.Queue()
+    threading.Thread(target=lambda: [out_q.put(json.loads(x)) for x in live.stdout if x.strip()], daemon=True).start()
+
+    def say(m):
+        live.stdin.write((json.dumps(m) + "\n").encode())
+        live.stdin.flush()
+
+    def until(pred, wait=10.0):
+        """-> what the running server wrote up to the first message that satisfies pred; None if none came in time"""
+        got_, end = [], time.time() + wait
+        while True:
+            try:
+                got_.append(out_q.get(timeout=max(0.0, end - time.time())))
+            except queue.Empty:
+                return None
+            if pred(got_[-1]):
+                return got_
+
+    def rpc(i, method, **params):
+        say({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+        return (until(lambda m: m.get("id") == i) or [{}])[-1]
+    changed = lambda m: m.get("method") == "notifications/tools/list_changed"      # noqa: E731
+    try:
+        caps = rpc(1, "initialize", protocolVersion="2025-06-18")["result"]["capabilities"]
+        say({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        before = rpc(2, "tools/list")["result"]["tools"]
+        e_live = env("alice", URL, HOME_A, CLAUDE_CODE_SESSION_ID="sess-live")
+        cli(e_live, "enable")
+        n_on = until(changed)
+        tools_on = [t["name"] for t in rpc(3, "tools/list")["result"]["tools"]]
+        call_on = rpc(4, "tools/call", name="read_inbox", arguments={})
+        cli(e_live, "disable")
+        n_off = until(changed)
+        tools_off = rpc(5, "tools/list")["result"]["tools"]
+        call_off = rpc(6, "tools/call", name="read_inbox", arguments={})
+        quiet_after = until(changed, 1.0)
+    finally:
+        live.stdin.close()
+        live.wait(10)
+    check("MCP, session turned on and then off while the server runs: tools/list_changed each time, the tools follow, "
+          "no notification when nothing changed",
+          caps == {"tools": {"listChanged": True}} and before == [] and n_on is not None and tools_on == THREE
+          and call_on["result"]["isError"] is False and n_off is not None and tools_off == []
+          and "error" in call_off and quiet_after is None and live.returncode == 0)
+
     # 3. opting in, and the hooks (bob's side: one unread message from alice, id sent["id"])
     r_off = hook(eB, "prompt", sid)
     open_ = cli(env("bob", URL, HOME_B, CLAUDE_CODE_SESSION_ID=sid), "enable")
@@ -339,7 +392,6 @@ try:
         lines = [json.loads(x) for x in r.stdout.decode().splitlines() if x.strip()]
         tools = [t["name"] for t in lines[1]["result"]["tools"]] if len(lines) == 2 else lines or None
         return tools, r.stderr.decode("utf-8", "replace"), r.returncode
-    THREE = ["send", "read_inbox", "ack"]
     normal = launch()
     check("plugin.json MCP server: the launcher starts it from another working directory; no env block (a value Claude "
           "Code does not expand would override the config file)",

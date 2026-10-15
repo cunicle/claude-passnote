@@ -41,7 +41,7 @@ Claude Code (Alice's laptop) ─┐                              ┌─ Claude C
    - The command prints a line like `"alice": "<64 hex digits>"`. That is the token's SHA-256, which is not secret. Send it to whoever runs the server.
    - Leave out the certificate if the server uses one from a public CA, such as Let's Encrypt.
 4. **Turn it on** in the session that should use it:
-   - `/passnote:enable` turns it on for the current session. The hooks work at once; the MCP tools appear after the session restarts.
+   - `/passnote:enable` turns it on for the current session. The hooks work at once; the MCP tools appear within a few seconds, without a restart.
    - Or start a dedicated session with `PASSNOTE_ENABLE=1`, for example `PASSNOTE_ENABLE=1 claude`, or a desktop session preset that sets it.
    - Do not set `PASSNOTE_ENABLE=1` globally, or every session will use passnote.
 5. **Check:** `/passnote:status`.
@@ -111,6 +111,7 @@ To change a token:
 | `PASSNOTE_HOME` | local directory: `config.json`, `ca.pem`, the enabled sessions and the hooks' state | `~/.config/claude-passnote` |
 | `PASSNOTE_ENABLE` | `1` turns passnote on for every session started with it; `0` forces it off | unset |
 | `PASSNOTE_POLL_SECONDS` | minimum interval between inbox checks after tool calls | `20` |
+| `PASSNOTE_MCP_POLL_SECONDS` | how often the MCP server checks whether passnote was turned on or off for its session, in seconds | `2` |
 | `PASSNOTE_HOOK_TIMEOUT` | HTTP timeout of the hooks, in seconds | `1.2` |
 | `PASSNOTE_PYTHON` | the Python interpreter to use, as a full path | the first of `python3`, `python`, `py` found |
 
@@ -190,7 +191,7 @@ Only for sessions with passnote turned on.
 | `server said 401` | The server does not know your token's hash yet. Send the line from `init` to whoever runs the server |
 | Certificate error | The certificate given to `init` is not the server's current one. Run `/passnote:init <name> <url> <new cert>` again |
 | The `passnote` MCP server fails to start | No Python 3.9+ was found on `PATH`. `/mcp` shows the error. Install Python, or set `PASSNOTE_PYTHON` (see [Which Python is used](#which-python-is-used)) |
-| `/mcp` shows passnote as `connected · no tools` | The session did not have passnote on when the MCP server started; it checks only then. Run `/passnote:enable`, then restart that session: `/exit` and `claude --resume <session id>` (`--continue` resumes the latest session of the current directory, which may be another one). Until then, `/passnote:mail` works |
+| `/mcp` shows passnote as `connected · no tools` | passnote is not on for this session. Run `/passnote:enable`: the MCP server checks every 2 seconds and tells Claude Code, which loads the tools within a few seconds. If they still do not appear, select `plugin:passnote:passnote` in `/mcp` and choose Reconnect. Until then, `/passnote:mail` works |
 
 ## Development
 

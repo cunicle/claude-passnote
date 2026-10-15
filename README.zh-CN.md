@@ -41,7 +41,7 @@ Claude Code（Alice 的笔记本）─┐                              ┌─ Cl
    - 命令会打印一行 `"alice": "<64 位十六进制>"`。这是 token 的 SHA-256，不是秘密，发给管理服务端的人即可。
    - 服务端用的如果是公共 CA 签发的证书（比如 Let's Encrypt），不用给证书参数。
 4. **在要用的会话里开启**：
-   - `/passnote:enable` 只开启当前会话。hooks 马上生效；MCP 工具要等会话重启后才出现。
+   - `/passnote:enable` 只开启当前会话。hooks 马上生效；MCP 工具几秒内自动出现，不用重启。
    - 也可以带着 `PASSNOTE_ENABLE=1` 新开一个专门的会话，比如 `PASSNOTE_ENABLE=1 claude`，或者桌面版里一个带这个变量的会话预设。
    - 不要把 `PASSNOTE_ENABLE=1` 设成全局变量，否则所有会话都会开启 passnote。
 5. **检查**：`/passnote:status`。
@@ -111,6 +111,7 @@ Claude Code（Alice 的笔记本）─┐                              ┌─ Cl
 | `PASSNOTE_HOME` | 本地目录：`config.json`、`ca.pem`、已开启的会话列表、hooks 的状态 | `~/.config/claude-passnote` |
 | `PASSNOTE_ENABLE` | `1`：带这个变量启动的会话都开启；`0`：强制关闭 | 不设 |
 | `PASSNOTE_POLL_SECONDS` | 工具调用后查信箱的最短间隔 | `20` |
+| `PASSNOTE_MCP_POLL_SECONDS` | MCP 服务多久检查一次本会话是否开启或关闭了 passnote（秒） | `2` |
 | `PASSNOTE_HOOK_TIMEOUT` | hooks 访问服务端的超时（秒） | `1.2` |
 | `PASSNOTE_PYTHON` | 要用的 Python，写完整路径 | 依次找到的第一个：`python3`、`python`、`py` |
 
@@ -190,7 +191,7 @@ agent 会遵守 passnote 自带的提示。在项目的 `CLAUDE.md` 里加一小
 | `server said 401` | 服务端还不知道你的 token 哈希：把 `init` 打印的那一行发给管理服务端的人 |
 | 证书错误 | `init` 时给的证书和服务端现在用的不一致：用新证书重新运行 `/passnote:init <名字> <地址> <新证书>` |
 | `passnote` 的 MCP 服务启动失败 | `PATH` 里找不到 Python 3.9+，`/mcp` 里能看到报错。装上 Python，或者设置 `PASSNOTE_PYTHON`（见[用的是哪个 Python](#用的是哪个-python)） |
-| `/mcp` 里 passnote 显示 `connected · no tools` | MCP 服务只在启动时检查本会话是否开启，启动时还没开启就没有工具。先 `/passnote:enable`，再重启这个会话：`/exit`，然后 `claude --resume <会话 ID>`。注意 `--continue` 接的是当前目录里最近的会话，可能不是这一个。重启前可以用 `/passnote:mail` |
+| `/mcp` 里 passnote 显示 `connected · no tools` | 本会话还没开启 passnote。运行 `/passnote:enable`：MCP 服务每 2 秒检查一次，发现开启了就通知 Claude Code，几秒内工具就会加载。还是没有的话，在 `/mcp` 里选 `plugin:passnote:passnote`，再选 Reconnect。在那之前可以用 `/passnote:mail` |
 
 ## 开发
 

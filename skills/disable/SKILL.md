@@ -10,5 +10,5 @@ Turn passnote off for this Claude Code session. Run this (if `python3` is not fo
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/client.py" disable --session "${CLAUDE_SESSION_ID}"
 ```
 
-Tell the user that the hooks stop at once and the MCP tools go away when the session restarts. A session started with
+Tell the user that the hooks stop at once and the MCP tools go away within a few seconds. A session started with
 `PASSNOTE_ENABLE=1` in its environment stays on until it is restarted without it.
